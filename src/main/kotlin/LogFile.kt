@@ -1,11 +1,9 @@
 @file:JvmName("LogFile")
 
-import PrimitiveSchema
 import java.io.OutputStream
 import java.lang.reflect.Modifier
 import java.nio.ByteBuffer
 import java.util.TreeMap
-import kotlin.collections.iterator
 
 sealed interface MessageSchema {
     // schema encoding
@@ -18,7 +16,7 @@ sealed interface MessageSchema {
 }
 
 class StructSchema(
-        val fields: Map<String, MessageSchema>,
+    val fields: Map<String, MessageSchema>,
 ) : MessageSchema {
     override fun encodedSize() = 8 + fields.map { (name, schema) ->
         4 + name.toByteArray(Charsets.UTF_8).size + schema.encodedSize()
@@ -36,23 +34,15 @@ class StructSchema(
     }
 
     override fun encodedObjSize(o: Any) =
-            fields.map { (name, schema) ->
-                if (name != "empty") {
-                    val field = o.javaClass.getField(name)
-                    schema.encodedObjSize(field.get(o)!!)
-                } else {
-                    PrimitiveSchema.INT.encodedObjSize(0)
-                }
-            }.sum()
+        fields.map { (name, schema) ->
+            val field = o.javaClass.getField(name)
+            schema.encodedObjSize(field.get(o)!!)
+        }.sum()
 
     override fun encodeObj(o: Any, b: ByteBuffer) {
         for ((name, schema) in fields) {
-            if (name != "empty") {
-                val field = o.javaClass.getField(name)
-                schema.encodeObj(field.get(o)!!, b)
-            } else {
-                PrimitiveSchema.INT.encodeObj(0, b)
-            }
+            val field = o.javaClass.getField(name)
+            schema.encodeObj(field.get(o)!!, b)
         }
     }
 }
@@ -130,7 +120,7 @@ class EnumSchema(val enumClass: Class<Enum<*>>) : MessageSchema {
 }
 
 class ArraySchema(val schema: MessageSchema) : MessageSchema {
-    override fun encodedSize() = 8 + schema.encodedSize()
+    override fun encodedSize() = 4 + schema.encodedSize()
 
     override fun encode(b: ByteBuffer) {
         b.putInt(7) // tag
@@ -160,44 +150,50 @@ class ArraySchema(val schema: MessageSchema) : MessageSchema {
 }
 
 fun schemaOfClass(c: Class<*>): MessageSchema =
-        when (c) {
-            Int::class.java, Int::class.javaObjectType -> PrimitiveSchema.INT
-            Long::class.java, Long::class.javaObjectType -> PrimitiveSchema.LONG
-            Double::class.java, Double::class.javaObjectType -> PrimitiveSchema.DOUBLE
-            String::class.java, String::class.javaObjectType -> PrimitiveSchema.STRING
-            Boolean::class.java, Boolean::class.javaObjectType -> PrimitiveSchema.BOOLEAN
-            else -> {
-                if (c.isArray) {
-                    ArraySchema(schemaOfClass(c.componentType!!))
-                } else if (c.isEnum) {
-                    // TODO: is there a way to make this cast safe?
-                    EnumSchema(c as Class<Enum<*>>)
-                } else {
-                    val fields = TreeMap<String, MessageSchema>()
-                    for (f in c.fields) {
-                        require(!Modifier.isStatic(f.modifiers)) { "static fields not supported" }
-                        fields[f.name] = schemaOfClass(f.type)
-                    }
-
-                        //require(fields.isNotEmpty()) { "empty structs not supported" }
-                    if (fields.isEmpty()) {
-                       fields["empty"] = PrimitiveSchema.BOOLEAN
-                    }
-
-                    StructSchema(fields)
+    when (c) {
+        Int::class.java, Int::class.javaObjectType -> PrimitiveSchema.INT
+        Long::class.java, Long::class.javaObjectType -> PrimitiveSchema.LONG
+        Double::class.java, Double::class.javaObjectType -> PrimitiveSchema.DOUBLE
+        String::class.java, String::class.javaObjectType -> PrimitiveSchema.STRING
+        Boolean::class.java, Boolean::class.javaObjectType -> PrimitiveSchema.BOOLEAN
+        else -> {
+            if (c.isArray) {
+                ArraySchema(schemaOfClass(c.componentType!!))
+            } else if (c.isEnum) {
+                // TODO: is there a way to make this cast safe?
+                EnumSchema(c as Class<Enum<*>>)
+            } else {
+                val fields = TreeMap<String, MessageSchema>()
+                for (f in c.fields) {
+                    require(!Modifier.isStatic(f.modifiers)) { "static fields not supported" }
+                    fields[f.name] = schemaOfClass(f.type)
                 }
+
+                require(fields.isNotEmpty()) { "empty structs not supported" }
+
+                StructSchema(fields)
             }
         }
+    }
+
+// 00: Initial version
+// 01: Fixes extra 4 bytes of size reported by array schemas
+private const val VERSION: Short = 1
 
 class LogWriter(val os: OutputStream) {
     init {
-        os.write(ByteBuffer.allocate(4).put('R'.code.toByte()).put('R'.code.toByte()).putShort(0).array()) // magic + version
+        os.write(
+            ByteBuffer.allocate(4)
+                .put('R'.code.toByte())
+                .put('R'.code.toByte())
+                .putShort(VERSION)
+                .array()) // magic + version
     }
 
     data class ChannelMetadata(
-            val className: String,
-            val index: Int,
-            val schema: MessageSchema,
+        val className: String,
+        val index: Int,
+        val schema: MessageSchema,
     )
 
     private val metadata = mutableMapOf<String, ChannelMetadata>()
@@ -218,7 +214,9 @@ class LogWriter(val os: OutputStream) {
             b.putInt(chBytes.size)
             b.put(chBytes)
             schema.encode(b)
-
+            require(!b.hasRemaining()) {
+                "encoded schema does not match reported size: ${b.remaining()} bytes remaining"
+            }
             os.write(b.array())
 
             m
@@ -232,6 +230,9 @@ class LogWriter(val os: OutputStream) {
         b.putInt(1) // message entry
         b.putInt(m.index) // channel index
         m.schema.encodeObj(o, b)
+        require(!b.hasRemaining()) {
+            "encoded object does not match reported size: ${b.remaining()} bytes remaining"
+        }
         os.write(b.array())
     }
 }
